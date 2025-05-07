@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from models.int_mistral_layer import QuantMistralDecoderLayer
+from models.int_qwen_layer import QuantQwen2DecoderLayer
 from quantize.int_linear import QuantLinear
 from contextlib import nullcontext
 import copy
@@ -76,8 +77,21 @@ def duquant(
             "down_proj":"down",
         }
         layer_name_prefix = "model.layers"
+    elif "qwen" in args.net.lower():
+        is_llama = True
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+        DecoderLayer = QuantMistralDecoderLayer
+        pairs = {
+            "q_proj":"qkv",
+            "o_proj":"out",
+            "up_proj":"fc1",
+            "down_proj":"down",
+        }
+        layer_name_prefix = "model.layers"
     else:
-        raise ValueError("Only support for llama/Llama-2/Llama-3/Vicuna/Mistral now")
+        raise ValueError("Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen now")
     
     
     layers[0] = layers[0].to(dev)
@@ -124,11 +138,11 @@ def duquant(
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "mistral" in args.net.lower():
+    if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "mistral" in args.net.lower() or "qwen" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     else:
-        raise ValueError("Only support for llama/Llama-2/Llama-3/Vicuna/Mistral now")
+        raise ValueError("Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen now")
     torch.cuda.empty_cache()
     
     quant_inps = inps
@@ -169,7 +183,7 @@ def duquant(
 
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i]
-        qlayer = DecoderLayer(lm.model.config, layer, args)
+        qlayer = DecoderLayer(lm.model.config, layer, args,layer_idx=i)
         qlayer = qlayer.to(dev)        
         if torch.cuda.device_count() > 1:
             qlayer.mlp.to("cuda:1")

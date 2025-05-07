@@ -7,15 +7,15 @@ import torch.nn.functional as F
 from quantize.du_norm import DuLlamaRMSNorm
 from collections import OrderedDict
 import math
-from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding,apply_rotary_pos_emb,LlamaRMSNorm,repeat_kv
-from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding,apply_rotary_pos_emb,Qwen2RMSNorm,repeat_kv
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.activations import ACT2FN
 import pdb
 import copy
 from models.transformation import *
 from quantize.DuquantKVCacheQuantizer import DuquantKVCacheQuantizer
 
-class QuantLlamaMLP(nn.Module):
+class QuantQwen2MLP(nn.Module):
     def __init__(
         self,
         org_module: nn.Module,
@@ -48,12 +48,12 @@ class QuantLlamaMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class QuantLlamaAttention(nn.Module):
+class QuantQwen2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, 
                  org_module: nn.Module,
-                 config: LlamaConfig,
+                 config: Qwen2Config,
                  args=None,
                  layer_idx:Optional[int] = None):
         super().__init__()
@@ -99,10 +99,10 @@ class QuantLlamaAttention(nn.Module):
         self.pv_matmul = QuantMatMul(
             args.p_quant_params, args.v_quant_params, matmul_func=torch.matmul, rotate=None
         )
-
+        
         self.k_cache_quantizer = DuquantKVCacheQuantizer(bits=4)
         self.v_cache_quantizer = DuquantKVCacheQuantizer(bits=4)
-        
+
         self.use_weight_quant = False
         self.use_act_quant = False
         self.init_duquant_params = torch.tensor(0) if args.gate_weight_quant_params['quant_method'] == 'duquant' else torch.tensor(1)
@@ -137,9 +137,9 @@ class QuantLlamaAttention(nn.Module):
         else:
             cos,sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        
 
-       
-    
+
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -199,21 +199,21 @@ class QuantLlamaAttention(nn.Module):
                 
 
 
-class QuantLlamaDecoderLayer(nn.Module):
+class QuantQwen2DecoderLayer(nn.Module):
     def __init__(self, 
-                 config: LlamaConfig,
+                 config: Qwen2Config,
                  ori_layer,
                  args,
                  layer_idx:int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = QuantLlamaAttention(
+        self.self_attn = QuantQwen2Attention(
             org_module=ori_layer.self_attn,
             config=config,
             args=args,
             layer_idx=layer_idx,
             )
-        self.mlp = QuantLlamaMLP(
+        self.mlp = QuantQwen2MLP(
             org_module=ori_layer.mlp,
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -230,7 +230,7 @@ class QuantLlamaDecoderLayer(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
+        use_cache: Optional[bool] = True,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -248,7 +248,7 @@ class QuantLlamaDecoderLayer(nn.Module):
         residual = hidden_states
         
         hidden_states = self.input_layernorm(hidden_states)
-        
+
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -271,7 +271,7 @@ class QuantLlamaDecoderLayer(nn.Module):
 
         if output_attentions:
             outputs += (self_attn_weights,)
-
+            
         if use_cache:
             outputs += (present_key_value,)
 
@@ -380,7 +380,7 @@ class QuantLlamaDecoderLayer(nn.Module):
     
     def register_duquant_params(self):        
         for name, module in self.named_modules():
-            if isinstance(module, QuantLlamaMLP) or isinstance(module, QuantLlamaAttention):
+            if isinstance(module, QuantQwen2MLP) or isinstance(module, QuantQwen2Attention):
                 delattr(module, 'init_duquant_params')
                 module.register_buffer('init_duquant_params', torch.tensor(1))
             if isinstance(module, QuantLinear):
