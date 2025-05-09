@@ -13,7 +13,7 @@ from transformers.activations import ACT2FN
 import pdb
 import copy
 from models.transformation import *
-from quantize.DuquantKVCacheQuantizer import DuquantKVCacheQuantizer
+from quantize.quantizer import UniformAffineQuantizer
 
 class QuantQwen2MLP(nn.Module):
     def __init__(
@@ -57,6 +57,7 @@ class QuantQwen2Attention(nn.Module):
                  args=None,
                  layer_idx:Optional[int] = None):
         super().__init__()
+        self.args = args
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -99,9 +100,9 @@ class QuantQwen2Attention(nn.Module):
         self.pv_matmul = QuantMatMul(
             args.p_quant_params, args.v_quant_params, matmul_func=torch.matmul, rotate=None
         )
-        
-        self.k_cache_quantizer = DuquantKVCacheQuantizer(bits=4)
-        self.v_cache_quantizer = DuquantKVCacheQuantizer(bits=4)
+        self.k_cache_quantizer = UniformAffineQuantizer(n_bits=args.abits, symmetric=False,per_channel_axes=[-1],metric="minmax",dynamic=False)
+        self.v_cache_quantizer = UniformAffineQuantizer(n_bits=args.abits, symmetric=False,per_channel_axes=[-1],metric="minmax",dynamic=False)
+        self.q_cache_quantizer = UniformAffineQuantizer(n_bits=args.abits, symmetric=False,per_channel_axes=[-1],metric="minmax",dynamic=False)
 
         self.use_weight_quant = False
         self.use_act_quant = False
@@ -110,6 +111,15 @@ class QuantQwen2Attention(nn.Module):
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
+    def quant_vcache(self, value_states):
+        value_states = self.v_cache_quantizer(value_states)
+        return value_states
+    
+    def quant_kcache(self, query_states, key_states):
+        query_states = self.q_cache_quantizer(query_states).to(query_states)
+        key_states = self.k_cache_quantizer(key_states).to(query_states)
+        return query_states,key_states
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -138,7 +148,12 @@ class QuantQwen2Attention(nn.Module):
             cos,sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         
-
+        if use_cache:
+            query_states, key_states = self.quant_kcache(query_states, key_states)
+            value_states = self.quant_vcache(value_states)
+        else:
+            query_states, key_states = query_states, key_states
+            value_states = value_states
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
