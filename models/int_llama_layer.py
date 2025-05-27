@@ -54,9 +54,9 @@ class QuantLlamaAttention(nn.Module):
     def __init__(self, 
                  org_module: nn.Module,
                  config: LlamaConfig,
+                 layer_idx: int,
                  args=None,
-                 layer_idx:Optional[int] = None,
-                 rotate=True):
+                 ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -100,26 +100,51 @@ class QuantLlamaAttention(nn.Module):
             args.p_quant_params, args.v_quant_params, matmul_func=torch.matmul, rotate=None
         )
 
-        self.k_cache_quantizer = UniformAffineQuantizer(n_bits=4, dynamic_method="per_token", rotate=rotate)
-        self.v_cache_quantizer = UniformAffineQuantizer(n_bits=4, dynamic_method="per_token", rotate=rotate)
-        self.q_cache_quantizer = UniformAffineQuantizer(n_bits=4, dynamic_method="per_token", rotate=rotate)
-        
+        self.k_cache_quantizer = UniformAffineQuantizer(
+            n_bits=args.abits,
+            symmetric=False,
+            dynamic=args.a_dynamic_method,
+            quant_method=args.quant_method,
+            dynamic_method="per_token",
+            rotate = True
+        )
+        self.v_cache_quantizer = UniformAffineQuantizer(
+            n_bits=args.abits,
+            symmetric=False,
+            dynamic=args.a_dynamic_method,
+            quant_method=args.quant_method,
+            dynamic_method="per_token",
+            rotate = True
+        )
+        self.q_cache_quantizer = UniformAffineQuantizer(
+            n_bits=args.abits,
+            symmetric=False,
+            dynamic=args.a_dynamic_method,
+            quant_method=args.quant_method,
+            dynamic_method="per_token",
+            rotate = True
+        )
+
+        self.use_cache = True
         self.use_weight_quant = False
         self.use_act_quant = False
         self.init_duquant_params = torch.tensor(0) if args.gate_weight_quant_params['quant_method'] == 'duquant' else torch.tensor(1)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
-    
+
     def quant_vcache(self, value_states):
-        value_states = self.v_cache_quantizer(value_states)
+        if self.use_act_quant:
+            value_states = self.v_cache_quantizer(value_states)
         return value_states
     
     def quant_kcache(self, query_states, key_states):
-        query_states = self.q_cache_quantizer(query_states).to(query_states)
-        key_states = self.k_cache_quantizer(key_states).to(query_states)
+        if self.use_act_quant:
+            query_states = self.q_cache_quantizer(query_states)
+        if self.use_act_quant:
+            key_states = self.k_cache_quantizer(key_states)
         return query_states,key_states
-
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -128,8 +153,6 @@ class QuantLlamaAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = True,
-        cache_position = None,
-        position_embeddings=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -142,22 +165,26 @@ class QuantLlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
-        if position_embeddings is None:
-            cos, sin = self.rotary_emb(value_states,kv_seq_len)
-        else:
-            cos,sin = position_embeddings
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        
+
         if use_cache:
             query_states, key_states = self.quant_kcache(query_states, key_states)
             value_states = self.quant_vcache(value_states)
-        else:
-            query_states, key_states = query_states, key_states
-            value_states = value_states
 
+        # [bsz, nh, t, hd]
+    
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -219,7 +246,7 @@ class QuantLlamaDecoderLayer(nn.Module):
                  config: LlamaConfig,
                  ori_layer,
                  args,
-                 layer_idx:int):
+                 layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = QuantLlamaAttention(
