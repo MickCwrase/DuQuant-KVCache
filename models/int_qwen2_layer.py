@@ -15,6 +15,7 @@ import copy
 from models.transformation import *
 from quantize.quantizer import UniformAffineQuantizer
 
+
 class QuantQwen2MLP(nn.Module):
     def __init__(
         self,
@@ -59,6 +60,7 @@ class QuantQwen2Attention(nn.Module):
                  ):
         super().__init__()
         self.config = config
+        self.attention_dropout = config.attention_dropout
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -66,6 +68,7 @@ class QuantQwen2Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -73,7 +76,7 @@ class QuantQwen2Attention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        self.rotary_emb = copy.deepcopy(org_module.rotary_emb)
+        self.rotary_emb = Qwen2RotaryEmbedding(config=self.config)
 
         self.k_proj = QuantLinear(
             org_module.k_proj,
@@ -113,7 +116,7 @@ class QuantQwen2Attention(nn.Module):
             symmetric=False,
             dynamic=args.a_dynamic_method,
             quant_method=args.quant_method,
-            dynamic_method="per_token",
+            dynamic_method="per_channel",
             rotate = True
         )
         self.q_cache_quantizer = UniformAffineQuantizer(
@@ -121,7 +124,7 @@ class QuantQwen2Attention(nn.Module):
             symmetric=False,
             dynamic=args.a_dynamic_method,
             quant_method=args.quant_method,
-            dynamic_method="per_token",
+            dynamic_method="per_channel",
             rotate = True
         )
 
@@ -148,14 +151,15 @@ class QuantQwen2Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = True,
+        cache_position = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
-
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         if not self.init_duquant_params:
             self.k_proj.copy_quantizers_duquant_params(self.q_proj)
@@ -164,16 +168,16 @@ class QuantQwen2Attention(nn.Module):
             self.v_proj.copy_quantizers_duquant_params(self.q_proj)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        if position_embeddings is None:
+            # logger.warning_once(
+            #     "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+            #     "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+            #     "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+            #     "removed and `position_embeddings` will be mandatory."
+            # )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if use_cache:
@@ -183,36 +187,28 @@ class QuantQwen2Attention(nn.Module):
         # [bsz, nh, t, hd]
 
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx)
-
+            cache_kwargs = {"sin": sin, "cos": cos,"cache_position": cache_position}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-        
-        attn_weights = self.qkt_matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            if attention_mask.shape[-1] < key_states.shape[-2]:
                 raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                    f"Attention mask last dim {attention_mask.shape[-1]} smaller than key_states {key_states.shape[-2]}"
                 )
-            attn_weights = attn_weights + attention_mask
-            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+            if attention_mask.shape[-1] != key_states.shape[-2]:
+                causal_mask = attention_mask[..., :key_states.shape[-2]]
+                attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = self.pv_matmul.quant_x1(attn_weights)
-        value_states = self.pv_matmul.quant_x2(value_states)
-        attn_output = self.pv_matmul(attn_weights, value_states)
-
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+        
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
@@ -273,6 +269,8 @@ class QuantQwen2DecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: Optional[torch.LongTensor] = None
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -299,6 +297,7 @@ class QuantQwen2DecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            position_embeddings=position_embeddings,
         )
         hidden_states = residual + hidden_states
 

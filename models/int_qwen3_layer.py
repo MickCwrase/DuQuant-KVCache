@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from quantize.du_norm import DuLlamaRMSNorm
 from collections import OrderedDict
 import math
-from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding,apply_rotary_pos_emb,LlamaRMSNorm,repeat_kv
-from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding,apply_rotary_pos_emb,Qwen3RMSNorm,repeat_kv
+from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.activations import ACT2FN
 import pdb
 import copy
@@ -16,7 +16,7 @@ from models.transformation import *
 from quantize.quantizer import UniformAffineQuantizer
 
 
-class QuantLlamaMLP(nn.Module):
+class QuantQwen3MLP(nn.Module):
     def __init__(
         self,
         org_module: nn.Module,
@@ -49,12 +49,12 @@ class QuantLlamaMLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
-class QuantLlamaAttention(nn.Module):
+class QuantQwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self, 
                  org_module: nn.Module,
-                 config: LlamaConfig,
+                 config: Qwen3Config,
                  layer_idx: int,
                  args=None,
                 ):
@@ -76,7 +76,7 @@ class QuantLlamaAttention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+        self.rotary_emb = Qwen3RotaryEmbedding(config=self.config)
         
         self.k_proj = QuantLinear(
             org_module.k_proj,
@@ -193,7 +193,7 @@ class QuantLlamaAttention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)        
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn_weights = torch.matmul(attn_weights, value_states)
 
         if attention_mask is not None:
             if attention_mask.shape[-1] < key_states.shape[-2]:
@@ -237,21 +237,21 @@ class QuantLlamaAttention(nn.Module):
                 
 
 
-class QuantLlamaDecoderLayer(nn.Module):
+class QuantQwen3DecoderLayer(nn.Module):
     def __init__(self, 
-                 config: LlamaConfig,
+                 config: Qwen3Config,
                  ori_layer,
                  args,
                  layer_idx:int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = QuantLlamaAttention(
+        self.self_attn = QuantQwen3Attention(
             org_module=ori_layer.self_attn,
             config=config,
             args=args,
             layer_idx=layer_idx,
             )
-        self.mlp = QuantLlamaMLP(
+        self.mlp = QuantQwen3MLP(
             org_module=ori_layer.mlp,
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -421,7 +421,7 @@ class QuantLlamaDecoderLayer(nn.Module):
     
     def register_duquant_params(self):        
         for name, module in self.named_modules():
-            if isinstance(module, QuantLlamaMLP) or isinstance(module, QuantLlamaAttention):
+            if isinstance(module, QuantQwen3MLP) or isinstance(module, QuantQwen3Attention):
                 delattr(module, 'init_duquant_params')
                 module.register_buffer('init_duquant_params', torch.tensor(1))
             if isinstance(module, QuantLinear):

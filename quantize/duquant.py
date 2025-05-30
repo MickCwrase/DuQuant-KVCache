@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from models.int_mistral_layer import QuantMistralDecoderLayer
-from models.int_qwen_layer import QuantQwen2DecoderLayer
+from models.int_qwen2_layer import QuantQwen2DecoderLayer
+from models.int_qwen3_layer import QuantQwen3DecoderLayer
 from quantize.int_linear import QuantLinear
 from contextlib import nullcontext
 import copy
@@ -77,12 +78,25 @@ def duquant(
             "down_proj":"down",
         }
         layer_name_prefix = "model.layers"
-    elif "qwen" in args.net.lower():
+    elif "qwen2" in args.net.lower():
         is_llama = True
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
-        DecoderLayer = QuantMistralDecoderLayer
+        DecoderLayer = QuantQwen2DecoderLayer
+        pairs = {
+            "q_proj":"qkv",
+            "o_proj":"out",
+            "up_proj":"fc1",
+            "down_proj":"down",
+        }
+        layer_name_prefix = "model.layers"
+    elif "qwen3" in args.net.lower():
+        is_llama = True
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+        DecoderLayer = QuantQwen3DecoderLayer
         pairs = {
             "q_proj":"qkv",
             "o_proj":"out",
@@ -91,7 +105,7 @@ def duquant(
         }
         layer_name_prefix = "model.layers"
     else:
-        raise ValueError("Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen now")
+        raise ValueError("Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen2/Qwen3 now")
     
     
     layers[0] = layers[0].to(dev)
@@ -138,11 +152,11 @@ def duquant(
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "mistral" in args.net.lower() or "qwen" in args.net.lower():
+    if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "mistral" in args.net.lower() or "qwen2" in args.net.lower() or "qwen3" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     else:
-        raise ValueError("Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen now")
+        raise ValueError("Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen2/Qwen3 now")
     torch.cuda.empty_cache()
     
     quant_inps = inps
