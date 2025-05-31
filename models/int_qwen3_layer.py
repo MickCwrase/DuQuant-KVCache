@@ -108,7 +108,7 @@ class QuantQwen3Attention(nn.Module):
             symmetric=False,
             dynamic=args.a_dynamic_method,
             quant_method=args.quant_method,
-            dynamic_method="per_channel",
+            dynamic_method="per_token",
             rotate = True
         )
         self.v_cache_quantizer = UniformAffineQuantizer(
@@ -116,7 +116,7 @@ class QuantQwen3Attention(nn.Module):
             symmetric=False,
             dynamic=args.a_dynamic_method,
             quant_method=args.quant_method,
-            dynamic_method="per_channel",
+            dynamic_method="per_token",
             rotate = True
         )
         self.q_cache_quantizer = UniformAffineQuantizer(
@@ -124,7 +124,7 @@ class QuantQwen3Attention(nn.Module):
             symmetric=False,
             dynamic=args.a_dynamic_method,
             quant_method=args.quant_method,
-            dynamic_method="per_channel",
+            dynamic_method="per_token",
             rotate = True
         )
 
@@ -193,7 +193,7 @@ class QuantQwen3Attention(nn.Module):
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)        
-        attn_weights = torch.matmul(attn_weights, value_states)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
             if attention_mask.shape[-1] < key_states.shape[-2]:

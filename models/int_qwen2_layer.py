@@ -116,7 +116,7 @@ class QuantQwen2Attention(nn.Module):
             symmetric=False,
             dynamic=args.a_dynamic_method,
             quant_method=args.quant_method,
-            dynamic_method="per_channel",
+            dynamic_method="per_token",
             rotate = True
         )
         self.q_cache_quantizer = UniformAffineQuantizer(
@@ -124,7 +124,7 @@ class QuantQwen2Attention(nn.Module):
             symmetric=False,
             dynamic=args.a_dynamic_method,
             quant_method=args.quant_method,
-            dynamic_method="per_channel",
+            dynamic_method="per_token",
             rotate = True
         )
 
